@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.venv/
+venv/
+env/
+.env
+
+# Pytest
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE
+.idea/
+*.iml
+
+# Emscripten test-harness output
+tmp_test/
+
+# Claude Code tool outputs
+graphify-out/
+.serena/
+.claude/settings.local.json

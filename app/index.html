@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>2D Wind Tunnel — Lattice Boltzmann / WebAssembly</title>
+<link rel="stylesheet" href="./style.css">
+</head>
+<body>
+  <canvas id="glcanvas"></canvas>
+  <canvas id="overlay"></canvas>
+
+  <pre id="hud">loading…</pre>
+
+  <button id="panel-toggle" title="Toggle controls">☰</button>
+
+  <aside id="panel">
+    <h1>Wind Tunnel</h1>
+
+    <section>
+      <h2>Simulation</h2>
+
+      <label for="res">Grid resolution <span class="val" id="res-val">300 × 150</span></label>
+      <input id="res" type="range" min="100" max="1000" step="20" value="300">
+
+      <label for="domlen">Domain length (L : H) <span class="val" id="domlen-val">2.0 : 1</span></label>
+      <input id="domlen" type="range" min="1" max="4" step="0.1" value="2">
+
+      <label for="vel">Inlet velocity <span class="val" id="vel-val">0.100</span></label>
+      <input id="vel" type="range" min="0.01" max="0.25" step="0.005" value="0.10">
+
+      <label for="angle">Angle of attack <span class="val" id="angle-val">0.0°</span></label>
+      <input id="angle" type="range" min="-25" max="25" step="0.5" value="0">
+
+      <label for="tau">Viscosity τ <span class="val" id="tau-val">0.550</span></label>
+      <input id="tau" type="range" min="0.502" max="2.0" step="0.001" value="0.55">
+      <p class="hint" id="re-val"></p>
+      <p class="hint">τ → 0.502 reaches Re ~ 10⁴ (keep the LES model on);
+        raise the resolution for a sharper vortex street.</p>
+
+      <label for="steps">Steps / frame <span class="val" id="steps-val">4</span></label>
+      <input id="steps" type="range" min="1" max="32" step="1" value="4">
+
+      <label for="walls">Tunnel walls</label>
+      <select id="walls">
+        <option value="freeslip" selected>Free-slip (specular)</option>
+        <option value="noslip">No-slip (bounce-back)</option>
+      </select>
+
+      <label class="row">
+        <input id="les" type="checkbox" checked>
+        Turbulence model (Smagorinsky LES)
+      </label>
+
+      <label class="row">
+        <input id="reg" type="checkbox" checked>
+        Regularized collision (stability)
+      </label>
+
+      <label for="profile">Inlet flow profile</label>
+      <select id="profile">
+        <option value="0" selected>Uniform flow</option>
+        <option value="1">Shear layer</option>
+        <option value="2">Jet</option>
+      </select>
+      <button id="reset-flow" class="wide">Reset flow</button>
+    </section>
+
+    <section>
+      <h2>Visualization</h2>
+
+      <div id="viz-mode" class="segmented wrap">
+        <button data-mode="velocity" class="active">Velocity</button>
+        <button data-mode="pressure">Pressure</button>
+        <button data-mode="vorticity">Vorticity</button>
+        <button data-mode="schlieren">Schlieren</button>
+        <button data-mode="dilatation">Dilatation</button>
+      </div>
+      <p class="hint">Schlieren = |∇ρ| (wave fronts &amp; shear layers);
+        dilatation = ∇·u (acoustic radiation).</p>
+
+      <label for="cmap">Colormap</label>
+      <select id="cmap">
+        <option value="JET">Jet</option>
+        <option value="INFERNO" selected>Inferno</option>
+        <option value="COOLWARM">Coolwarm</option>
+        <option value="VIRIDIS">Viridis</option>
+        <option value="GRAY">Gray (schlieren)</option>
+      </select>
+
+      <label for="flow-overlay">Flow overlay</label>
+      <select id="flow-overlay">
+        <option value="none" selected>None</option>
+        <option value="streamlines">Streamlines</option>
+        <option value="arrows">Velocity arrows</option>
+        <option value="particles">Tracer particles</option>
+      </select>
+
+      <div id="particle-opts" style="display:none">
+        <label for="psize">Particle size <span class="val" id="psize-val">2</span></label>
+        <input id="psize" type="range" min="1" max="6" step="1" value="2">
+        <label class="row" for="pcolor">
+          Particle color
+          <input id="pcolor" type="color" value="#ffffff">
+        </label>
+      </div>
+
+      <label class="row">
+        <input id="scale-mode" type="checkbox">
+        Fixed scale
+      </label>
+      <div id="fixed-scale-row" class="row" style="display:none">
+        <input id="scale-min" type="number" step="0.01" value="0">
+        <span>to</span>
+        <input id="scale-max" type="number" step="0.01" value="0.2">
+      </div>
+    </section>
+
+    <section>
+      <h2>Obstacles</h2>
+
+      <div class="segmented">
+        <button id="mode-draw" class="active">Draw</button>
+        <button id="mode-erase">Erase</button>
+      </div>
+      <p class="hint">Drag on the canvas to paint or erase walls.</p>
+      <p class="hint">Click a preset, then click in the tunnel to place it
+        (a ghost outline follows the cursor; Esc cancels).</p>
+
+      <div class="preset-grid">
+        <button data-preset="cylinder">Cylinder</button>
+        <button data-preset="plate">Flat plate</button>
+        <button data-preset="naca0012">NACA 0012</button>
+        <button data-preset="naca4412">NACA 4412</button>
+      </div>
+
+      <label for="spin">Cylinder spin <span class="val" id="spin-val">0.000</span></label>
+      <input id="spin" type="range" min="-0.15" max="0.15" step="0.005" value="0">
+      <p class="hint">Surface speed of newly placed cylinders (+ is
+        counter-clockwise). Each placed cylinder gets its own slider below.</p>
+      <div id="cyl-list"></div>
+
+      <button id="clear-obstacles" class="danger">Clear all</button>
+    </section>
+  </aside>
+
+  <script type="module" src="./main.js"></script>
+</body>
+</html>

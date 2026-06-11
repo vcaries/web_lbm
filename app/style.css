@@ -1,0 +1,245 @@
+/* style.css — full-viewport canvas + collapsible right-hand control panel */
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+  background: #0b0d10;
+  color: #d7dce2;
+  font: 13px/1.45 system-ui, "Segoe UI", sans-serif;
+}
+
+/* Both canvases are letterboxed to the domain aspect ratio by
+ * layoutCanvases() in main.js (inline left/top/width/height), so grid
+ * cells always display square; these are just the pre-boot defaults. */
+#glcanvas {
+  position: fixed;
+  left: 0;
+  top: 0;
+  width: 100vw;
+  height: 100vh;
+  display: block;
+  cursor: crosshair;
+  touch-action: none;          /* pointer events handle painting */
+}
+
+/* 2D overlay (ghost preview, streamlines, arrows, tracer particles).
+ * Never intercepts input — the GL canvas below owns all pointer events. */
+#overlay {
+  position: fixed;
+  left: 0;
+  top: 0;
+  width: 100vw;
+  height: 100vh;
+  display: block;
+  pointer-events: none;
+  z-index: 2;
+}
+
+/* HUD overlay (top-left) */
+#hud {
+  position: fixed;
+  top: 10px;
+  left: 12px;
+  margin: 0;
+  padding: 8px 12px;
+  background: rgba(8, 10, 13, 0.65);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 6px;
+  color: #e8edf2;
+  font: 12px/1.5 ui-monospace, Consolas, monospace;
+  white-space: pre;
+  pointer-events: none;
+  z-index: 5;
+}
+
+/* Panel toggle (always visible) */
+#panel-toggle {
+  position: fixed;
+  top: 10px;
+  right: 10px;
+  z-index: 11;
+  width: 34px;
+  height: 34px;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 6px;
+  background: rgba(20, 24, 30, 0.85);
+  color: #d7dce2;
+  font-size: 16px;
+  cursor: pointer;
+}
+#panel-toggle:hover { background: rgba(40, 48, 60, 0.9); }
+
+/* Side panel */
+#panel {
+  position: fixed;
+  top: 0;
+  right: 0;
+  width: 280px;
+  height: 100vh;
+  overflow-y: auto;
+  padding: 14px 16px 24px;
+  background: rgba(14, 17, 22, 0.92);
+  border-left: 1px solid rgba(255, 255, 255, 0.08);
+  backdrop-filter: blur(6px);
+  z-index: 10;
+  transition: transform 0.2s ease;
+}
+#panel.collapsed { transform: translateX(100%); }
+
+#panel h1 {
+  margin: 4px 44px 10px 0;
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: 0.4px;
+}
+#panel h2 {
+  margin: 18px 0 8px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: #8d97a5;
+}
+#panel section { border-top: 1px solid rgba(255, 255, 255, 0.06); }
+#panel section:first-of-type { border-top: none; }
+
+label {
+  display: block;
+  margin: 10px 0 2px;
+  color: #aeb7c2;
+}
+label .val {
+  float: right;
+  color: #6fc3ff;
+  font-variant-numeric: tabular-nums;
+}
+
+input[type="range"] {
+  width: 100%;
+  margin: 4px 0 2px;
+  accent-color: #3b9eff;
+}
+
+select,
+input[type="number"] {
+  width: 100%;
+  margin: 4px 0;
+  padding: 5px 8px;
+  background: #1a2027;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 5px;
+  color: #d7dce2;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 0;
+}
+.row input[type="checkbox"] { accent-color: #3b9eff; }
+.row input[type="number"] { flex: 1; margin: 0; }
+.row input[type="color"] {
+  margin-left: auto;
+  width: 44px;
+  height: 24px;
+  padding: 1px;
+  background: #1a2027;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 5px;
+  cursor: pointer;
+}
+
+.segmented {
+  display: flex;
+  margin: 6px 0;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.segmented button {
+  flex: 1;
+  padding: 6px 0;
+  background: transparent;
+  border: none;
+  border-left: 1px solid rgba(255, 255, 255, 0.10);
+  color: #aeb7c2;
+  cursor: pointer;
+  font: inherit;
+}
+.segmented button:first-child { border-left: none; }
+.segmented button.active { background: #2563eb; color: #fff; }
+.segmented button:not(.active):hover { background: rgba(255, 255, 255, 0.06); }
+
+/* Wrapping variant for segmented controls with more than ~3 entries. */
+.segmented.wrap { flex-wrap: wrap; }
+.segmented.wrap button {
+  flex: 1 1 33%;
+  min-width: 33%;
+  border-top: 1px solid rgba(255, 255, 255, 0.10);
+}
+
+.preset-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+  margin: 8px 0;
+}
+.preset-grid button,
+#clear-obstacles {
+  padding: 7px 4px;
+  background: #1a2027;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 6px;
+  color: #d7dce2;
+  cursor: pointer;
+  font: inherit;
+}
+.preset-grid button:hover { background: #242c36; }
+
+#clear-obstacles, .wide { width: 100%; }
+#reset-flow {
+  width: 100%;
+  margin-top: 6px;
+  padding: 7px 4px;
+  background: #1a2027;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 6px;
+  color: #d7dce2;
+  cursor: pointer;
+  font: inherit;
+}
+#reset-flow:hover { background: #242c36; }
+.preset-grid button.placing {
+  background: #2563eb;
+  border-color: #3b82f6;
+  color: #fff;
+}
+#clear-obstacles.danger { border-color: rgba(255, 90, 90, 0.4); color: #ff9a9a; }
+#clear-obstacles.danger:hover { background: rgba(255, 90, 90, 0.12); }
+
+.hint {
+  margin: 2px 0 8px;
+  color: #76818e;
+  font-size: 12px;
+}
+
+/* Per-cylinder spin sliders (built dynamically in #cyl-list). */
+.cyl-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 4px 0;
+}
+.cyl-row span:first-child { color: #aeb7c2; white-space: nowrap; }
+.cyl-row input[type="range"] { flex: 1; margin: 0; }
+.cyl-row .val {
+  float: none;
+  min-width: 44px;
+  text-align: right;
+  color: #6fc3ff;
+  font-variant-numeric: tabular-nums;
+}
