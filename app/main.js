@@ -17,23 +17,51 @@ import { rasterizePreset, outlinePreset, PRESETS } from './obstacles.js';
 
 const $ = (id) => document.getElementById(id);
 
+/* Migration guard: an earlier revision registered the COI service worker
+ * with an /app/-scoped registration, which cannot cover the pthread
+ * worker scripts in dist/ (they load without injected COEP and the
+ * browser blocks them). Unregister it so the root-scoped one takes over
+ * on the next visit. Harmless when no such registration exists. */
+if (navigator.serviceWorker) {
+  navigator.serviceWorker.getRegistrations().then((regs) => {
+    for (const r of regs) {
+      if (new URL(r.scope).pathname.endsWith('/app/')) r.unregister();
+    }
+  });
+}
+
 /* Engine selection: the -pthread build needs crossOriginIsolated
  * (SharedArrayBuffer). coi-serviceworker provides that on GitHub Pages
  * after a one-time reload; anywhere it isn't available we fall back to
  * the single-threaded engine, which is feature-identical. */
 let engineMT = false;
 let threadCount = 1;
+
+function withTimeout(promise, ms, what) {
+  return Promise.race([promise, new Promise((_, reject) =>
+    setTimeout(() => reject(new Error(`${what} timed out after ${ms} ms`)), ms),
+  )]);
+}
+
+/** Returns a ready Module instance. The -pthread engine gets a hard
+ *  timeout: if its worker pool fails to come up (MIME issues, blocked
+ *  workers, partial COI) we abandon it and boot the single-threaded
+ *  engine instead of hanging at "loading…". */
 async function loadEngine() {
   if (window.crossOriginIsolated) {
     try {
-      const mod = await import('../dist/lbm_engine_mt.js');
+      const mod = await withTimeout(import('../dist/lbm_engine_mt.js'),
+                                    5000, 'mt engine import');
+      const inst = await withTimeout(mod.default(), 5000, 'mt engine init');
       engineMT = true;
-      return mod.default;
+      return inst;
     } catch (err) {
       console.warn('Multithreaded engine unavailable, using single-threaded:', err);
     }
+  } else {
+    console.info('Not crossOriginIsolated — using the single-threaded engine.');
   }
-  return (await import('../dist/lbm_engine.js')).default;
+  return (await import('../dist/lbm_engine.js')).default();
 }
 
 let Module;            // Emscripten module instance
@@ -886,8 +914,7 @@ function setupUI() {
 /* ------------------------------------------------------------------ */
 
 async function boot() {
-  const createLBM = await loadEngine();
-  Module = await createLBM();
+  Module = await loadEngine();
   forcesPtr = Module._malloc(8);
 
   const canvas = $('glcanvas');

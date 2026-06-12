@@ -7,8 +7,13 @@
 <!-- coi-serviceworker: provides COOP/COEP (crossOriginIsolated) on static
      hosts like GitHub Pages so the multithreaded engine can use
      SharedArrayBuffer. Registers a service worker and reloads once; a
-     no-op where headers are already set or service workers unavailable. -->
-<script src="./coi-serviceworker.min.js"></script>
+     no-op where headers are already set or service workers unavailable.
+     The script MUST live at the site root: the service-worker scope is
+     its directory, and it has to cover the pthread worker scripts in
+     dist/ — an /app/-scoped worker would leave them outside the scope,
+     their responses without injected COEP, and the browser blocks them
+     (ERR_BLOCKED_BY_RESPONSE). -->
+<script src="../coi-serviceworker.min.js"></script>
 <link rel="stylesheet" href="./style.css">
 </head>
 <body>

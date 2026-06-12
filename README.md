@@ -50,9 +50,14 @@ most:
 Wasm cannot be loaded from `file://`; serve the repo root over HTTP:
 
 ```sh
-python -m http.server 8000
-# then open http://localhost:8000/app/
+python serve_coi.py
+# then open http://localhost:8001/app/
 ```
+
+`serve_coi.py` sends real COOP/COEP headers, so the multithreaded engine
+starts directly. A plain `python -m http.server 8000` also works — the
+service-worker shim then provides the headers (one automatic reload, the
+same mechanism used on GitHub Pages).
 
 To deploy on GitHub Pages, publish the repo (or copy `app/` + `dist/`
 preserving their relative layout) — all asset paths are relative.
