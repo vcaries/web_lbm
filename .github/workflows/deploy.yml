@@ -1,0 +1,76 @@
+# Build the wasm engine with Emscripten and deploy the app to GitHub Pages.
+#
+# dist/ is gitignored (build output), so the engine is rebuilt here on every
+# push to main with the same build.sh used locally. The deployed tree mirrors
+# the repo layout the app expects:
+#   /index.html                 root redirect to app/
+#   /coi-serviceworker.min.js   root-scoped COOP/COEP shim (must stay at root
+#                               so its service-worker scope covers dist/)
+#   /app/                       frontend
+#   /dist/                      emcc output (both engine variants)
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Emscripten
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: latest
+
+      - name: Build engine (both variants)
+        run: bash build.sh
+
+      - name: Smoke-test physics (node build of lbm.c)
+        run: |
+          mkdir -p tmp_test
+          emcc src/lbm.c -O2 -DLBM_TEST_MAIN -s ENVIRONMENT=node \
+            -s ALLOW_MEMORY_GROWTH=1 -o tmp_test/test.js
+          node tmp_test/test.js
+
+      - name: Assemble site
+        run: |
+          mkdir -p _site/app _site/dist
+          cp index.html coi-serviceworker.min.js _site/
+          cp -r app/. _site/app/
+          cp dist/lbm_engine.js dist/lbm_engine.wasm \
+             dist/lbm_engine_mt.js dist/lbm_engine_mt.wasm _site/dist/
+          touch _site/.nojekyll
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+        with:
+          enablement: true
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
