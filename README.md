@@ -24,7 +24,16 @@ bash build.sh --mrt    # MRT collision operator (more stable at high Re)
 build.bat              :: Windows cmd, same flags / same fallback
 ```
 
-Output: `dist/lbm_engine.js` (ES-module glue) + `dist/lbm_engine.wasm`.
+Output: two engine variants, each ES-module glue + wasm:
+
+- `dist/lbm_engine.js` — single-threaded, works everywhere;
+- `dist/lbm_engine_mt.js` — built with `-pthread` (WebAssembly threads on
+  `SharedArrayBuffer`). Threads need the page to be `crossOriginIsolated`
+  (COOP/COEP headers); static hosts like GitHub Pages cannot send those,
+  so `app/coi-serviceworker.min.js` injects them via a service worker
+  (one automatic reload on first visit). The app feature-detects at boot
+  and falls back to the single-threaded engine seamlessly — the HUD shows
+  the active thread count.
 Every emcc flag is documented inline in `build.sh`; the two that matter
 most:
 
@@ -134,6 +143,14 @@ pressure wavefronts a shedding cylinder emits (aeolian tones) and the
 startup transient racing through the domain at the speed of sound. Both
 are central-difference fields computed alongside vorticity.
 
+**Virtual microphones.** Up to four pressure probes can be placed in the
+tunnel (Microphones panel). Each samples `p = ρ/3` once per frame into a
+4096-sample ring buffer; the bottom-left panel shows the Hann-windowed
+FFT of the pressure fluctuation per probe, with the **Strouhal number**
+`St = f L / u₀` of the dominant peak — for a cylinder von Kármán street
+expect St ≈ 0.2. Probe positions are stored normalized, so they survive
+grid resizes (recordings restart).
+
 **Reynolds number.** `Re = u₀ L / ν` is displayed live; with the default
 cylinder (`D ≈ 0.25 Ny`), `τ = 0.55` and `u₀ = 0.1` gives `Re ≈ 220` — a
 clear von Kármán vortex street in the vorticity view. Raise `τ` toward
@@ -199,6 +216,16 @@ flags):
 At 4 steps/frame this keeps even a 1000-cell-long tunnel within a 60 fps
 frame budget (~34 ms → use 1–2 steps/frame), and the default 300×150 grid
 costs under 3 ms of simulation per frame.
+
+On top of that, the multithreaded engine row-partitions the interior
+sweep and the solid-link fixup across a pthread pool (race-free by
+construction: every destination slot has exactly one producer cell;
+forces reduce in thread order, so results are deterministic for a given
+thread count). Measured on a 4-core laptop under Node: 1.3–1.8× over the
+vectorized single-thread kernel — LBM is memory-bandwidth-bound, so
+machines with more memory channels scale further. Finally, only the
+derivative field being displayed (vorticity / schlieren / dilatation) is
+computed each frame; the others are skipped.
 
 ## Zero-copy data path
 

@@ -124,6 +124,15 @@ static inline float ramp_factor(void)
                                 : ((float)ramp_t + 1.f) / (float)RAMP_STEPS;
 }
 
+/* Which derivative fields lbm_compute_fields() fills, as a bitmask:
+ * 1 = vorticity, 2 = schlieren, 4 = dilatation. The moments (rho, u,
+ * speed) are always computed; the UI displays one field at a time, so
+ * it narrows the mask to skip the unused finite-difference passes. */
+#define FIELD_VORT 1
+#define FIELD_SCHL 2
+#define FIELD_DIL  4
+static int field_mask = FIELD_VORT | FIELD_SCHL | FIELD_DIL;
+
 /* Inlet flow profile: 0 = uniform, 1 = shear layer, 2 = jet.
  * Applied both to the initial condition and to the Zou-He inlet, so the
  * selected profile is sustained, not just a transient. */
@@ -569,13 +578,39 @@ static inline float collide_cell(int k, float inv_tau, float *restrict post)
  * dF = 2 e_i f_i^pc. u_w is nonzero only on rotating cylinder cells.
  */
 static inline void bounce_into_solid(int k, int kt, int i, float rho,
-                                     float fi)
+                                     float fi, float *fx, float *fy)
 {
     float du = (float)ex[i] * uwx[kt] + (float)ey[i] * uwy[kt];
     float fr = fi - 6.f * w9[i] * rho * du;
     f_tmp[opp[i]][k] = fr;
-    Fx_step += (fi + fr) * (float)ex[i];
-    Fy_step += (fi + fr) * (float)ey[i];
+    *fx += (fi + fr) * (float)ex[i];
+    *fy += (fi + fr) * (float)ey[i];
+}
+
+/* Fixup over rows [y0, y1): convert the populations pushed into solid
+ * cells into bounce-back + momentum-exchange force (accumulated through
+ * fx and fy so concurrent slices don't share an accumulator). See the
+ * call site in collide_stream for the full story. */
+static void fixup_rows(int y0, int y1, float *fx, float *fy)
+{
+    for (int y = y0; y < y1; y++) {
+        for (int x = 0; x < Nx; x++) {
+            int kt = idx(x, y);
+            if (!obstacle[kt]) continue;
+            for (int j = 1; j < 9; j++) {
+                int nx2 = x + ex[j], ny2 = y + ey[j];
+                if (nx2 < 0 || nx2 >= Nx || ny2 < 0 || ny2 >= Ny) continue;
+                int n = idx(nx2, ny2);
+                if (obstacle[n]) continue;
+                int i = opp[j];               /* direction n -> solid */
+                /* rho of n: collision conserves it, so the pre-collision
+                 * sum equals the value collide_cell saw. */
+                float rho = f[0][n]+f[1][n]+f[2][n]+f[3][n]+f[4][n]
+                          + f[5][n]+f[6][n]+f[7][n]+f[8][n];
+                bounce_into_solid(n, kt, i, rho, f_tmp[i][kt], fx, fy);
+            }
+        }
+    }
 }
 
 /* Push the post-collision populations of a domain-border fluid cell.
@@ -609,6 +644,129 @@ static void push_border_cell(int x, int y, const float *post)
         }
     }
 }
+
+static void sweep_interior(int y0, int y1);
+
+/*
+ * Worker pool. The interior sweep is row-partitioned across threads:
+ * every f_tmp slot has exactly one producer cell, so concurrent slices
+ * write disjoint locations and read only the immutable f arrays — no
+ * locks needed, just a start barrier (releases the workers) and an end
+ * barrier (everyone finished) per step. Workers block on the barrier
+ * between steps (futex wait, no spinning). Threads require the page to
+ * be crossOriginIsolated (SharedArrayBuffer); the single-thread build
+ * compiles the no-op fallback below.
+ */
+#ifdef __EMSCRIPTEN_PTHREADS__
+#include <pthread.h>
+#define MAX_THREADS 16
+static int n_threads = 1;            /* total participants incl. main  */
+static int pool_started = 0;
+static pthread_barrier_t bar_start, bar_mid, bar_end;
+
+/* Per-thread force accumulators, padded to separate cache lines. The
+ * partials are reduced on the main thread in tid order, so the result
+ * is deterministic for a given thread count. */
+typedef struct { float fx, fy; char pad[56]; } ForcePart;
+static ForcePart fpart[MAX_THREADS];
+
+static void sweep_slice(int tid)
+{
+    int rows = Ny - 2;
+    if (rows <= 0) return;
+    int chunk = (rows + n_threads - 1) / n_threads;
+    int y0 = 1 + tid * chunk;
+    int y1 = y0 + chunk;
+    if (y1 > Ny - 1) y1 = Ny - 1;
+    if (y0 < y1) sweep_interior(y0, y1);
+}
+
+static void fixup_slice(int tid)
+{
+    int chunk = (Ny + n_threads - 1) / n_threads;
+    int y0 = tid * chunk;
+    int y1 = y0 + chunk;
+    if (y1 > Ny) y1 = Ny;
+    fpart[tid].fx = 0.f; fpart[tid].fy = 0.f;
+    if (y0 < y1) fixup_rows(y0, y1, &fpart[tid].fx, &fpart[tid].fy);
+}
+
+static volatile int pool_go = 0;
+
+static void *worker_main(void *arg)
+{
+    int tid = (int)(intptr_t)arg;
+    /* Spin until lbm_set_threads has counted the spawned workers and
+     * sized the barriers (a one-time, microsecond window). */
+    while (!__atomic_load_n(&pool_go, __ATOMIC_ACQUIRE)) {}
+    for (;;) {
+        pthread_barrier_wait(&bar_start);
+        sweep_slice(tid);
+        /* The fixup reads values the interior sweep pushed into solid
+         * cells from *other* slices, so it needs the full sweep done. */
+        pthread_barrier_wait(&bar_mid);
+        fixup_slice(tid);
+        pthread_barrier_wait(&bar_end);
+    }
+    return NULL;
+}
+
+/* Start the worker pool (one-shot: call once, before heavy stepping).
+ * Threads must come from the preallocated Emscripten pool
+ * (PTHREAD_POOL_SIZE), otherwise they cannot start until the main
+ * thread yields to the event loop. The barriers are sized by the count
+ * that actually spawned, and the workers are only released after, so a
+ * partial spawn can never deadlock the step barrier. */
+EXPORT void lbm_set_threads(int n)
+{
+    if (pool_started || n < 2) return;
+    if (n > MAX_THREADS) n = MAX_THREADS;
+    int spawned = 1;                 /* main thread is participant 0 */
+    for (int t = 1; t < n; t++) {
+        pthread_t th;
+        if (pthread_create(&th, NULL, worker_main,
+                           (void *)(intptr_t)spawned) == 0)
+            spawned++;
+    }
+    n_threads = spawned;
+    pool_started = 1;
+    if (spawned < 2) return;
+    pthread_barrier_init(&bar_start, NULL, spawned);
+    pthread_barrier_init(&bar_mid, NULL, spawned);
+    pthread_barrier_init(&bar_end, NULL, spawned);
+    __atomic_store_n(&pool_go, 1, __ATOMIC_RELEASE);
+}
+
+EXPORT int lbm_get_threads(void) { return n_threads; }
+
+/* Run interior sweep + solid-link fixup across the pool; the per-thread
+ * force partials are reduced here in tid order (deterministic). */
+static void sweep_dispatch(void)
+{
+    if (n_threads > 1) {
+        pthread_barrier_wait(&bar_start);   /* release the workers */
+        sweep_slice(0);                     /* main takes slice 0  */
+        pthread_barrier_wait(&bar_mid);
+        fixup_slice(0);
+        pthread_barrier_wait(&bar_end);
+        for (int t = 0; t < n_threads; t++) {
+            Fx_step += fpart[t].fx;
+            Fy_step += fpart[t].fy;
+        }
+    } else {
+        sweep_interior(1, Ny - 1);
+        fixup_rows(0, Ny, &Fx_step, &Fy_step);
+    }
+}
+#else
+EXPORT void lbm_set_threads(int n) { (void)n; }
+EXPORT int  lbm_get_threads(void)  { return 1; }
+static void sweep_dispatch(void)
+{
+    sweep_interior(1, Ny - 1);
+    fixup_rows(0, Ny, &Fx_step, &Fy_step);
+}
+#endif
 
 static void collide_stream(void)
 {
@@ -665,17 +823,42 @@ static void collide_stream(void)
     }
 
     /*
-     * Interior sweep. Completely branchless: every push target is
-     * in-grid, and solid cells are collided and pushed like fluid (their
-     * populations sit at the w9 equilibrium fixed point or hold stale-
-     * but-finite values, so the arithmetic is harmless and the values
-     * they leak into neighbours are overwritten by the fixup pass below).
-     * The BGK body is inlined here with restrict-qualified pointer
-     * copies: without them LLVM cannot prove the nine source and nine
-     * destination arrays are disjoint and refuses to vectorize. The LES
-     * toggle is folded into the arithmetic (smag_eff = 0 makes
-     * tau_eff = tau exactly), so the loop body has no branches at all.
+     * Interior sweep + fixup pass, row-partitioned across the thread
+     * pool when one is running. The fixup converts every population
+     * pushed into a solid cell during the sweep (each fluid neighbour n
+     * pushed f_i^pc into the solid's f_tmp slot, i = direction n->solid)
+     * into halfway bounce-back with the moving-wall term, accumulating
+     * the momentum-exchange force, and overwrites the stray values solid
+     * cells pushed into their fluid neighbours. For fluid-dominated
+     * grids the scan reads only the byte mask — same cost as the repair
+     * pass the old two-kernel formulation needed anyway.
      */
+    sweep_dispatch();
+
+    /* Exponential moving average for a readable HUD (~40-step memory). */
+    Fx_s += 0.05f * (Fx_step - Fx_s);
+    Fy_s += 0.05f * (Fy_step - Fy_s);
+}
+
+/*
+ * Interior sweep over rows [y0, y1). Completely branchless: every push
+ * target is in-grid, and solid cells are collided and pushed like fluid
+ * (their populations sit at the w9 equilibrium fixed point or hold
+ * stale-but-finite values, so the arithmetic is harmless and the values
+ * they leak into neighbours are overwritten by the fixup pass).
+ * The BGK body is inlined here with restrict-qualified pointer copies:
+ * without them LLVM cannot prove the nine source and nine destination
+ * arrays are disjoint and refuses to vectorize. The LES toggle is folded
+ * into the arithmetic (smag_eff = 0 makes tau_eff = tau exactly), so the
+ * loop body has no branches at all.
+ *
+ * Thread-safety: every f_tmp slot has exactly one producer cell, so
+ * row-partitioned concurrent sweeps write disjoint locations and read
+ * only the immutable f arrays — race-free with no locks.
+ */
+static void sweep_interior(int y0, int y1)
+{
+    float inv_tau = 1.f / tau;
 #ifndef USE_MRT
     {
         const float *restrict p0 = f[0], *restrict p1 = f[1],
@@ -691,7 +874,8 @@ static void collide_stream(void)
         float smag_eff = les_on ? smag_c2 : 0.f;
         float regf = regularized ? 1.f : 0.f;
         float tau_l = tau;
-        for (int y = 1; y < Ny - 1; y++) {
+        (void)inv_tau;
+        for (int y = y0; y < y1; y++) {
             int k = y * Nx + 1;
             for (int x = 1; x < Nx - 1; x++, k++) {
                 float f0=p0[k], f1=p1[k], f2=p2[k], f3=p3[k], f4=p4[k],
@@ -751,7 +935,7 @@ static void collide_stream(void)
         }
     }
 #else
-    for (int y = 1; y < Ny - 1; y++) {
+    for (int y = y0; y < y1; y++) {
         int k = y * Nx + 1;
         for (int x = 1; x < Nx - 1; x++, k++) {
             float post[9];
@@ -769,39 +953,6 @@ static void collide_stream(void)
         }
     }
 #endif
-
-    /*
-     * Fixup pass — fluid/solid links. For every solid cell, each in-grid
-     * fluid neighbour n pushed its post-collision population f_i^pc into
-     * the solid's f_tmp slot above (i = direction n -> solid). Read it
-     * back, reflect it into n as halfway bounce-back (with the moving-
-     * wall term for rotating cylinders), and accumulate the momentum-
-     * exchange force. This also overwrites the stray values solid cells
-     * pushed into their fluid neighbours. The scan reads only the byte
-     * mask for fluid-dominated grids — same cost as the repair pass the
-     * old two-kernel formulation needed anyway.
-     */
-    for (int y = 0; y < Ny; y++) {
-        for (int x = 0; x < Nx; x++) {
-            int kt = idx(x, y);
-            if (!obstacle[kt]) continue;
-            for (int j = 1; j < 9; j++) {
-                int nx2 = x + ex[j], ny2 = y + ey[j];
-                if (nx2 < 0 || nx2 >= Nx || ny2 < 0 || ny2 >= Ny) continue;
-                int n = idx(nx2, ny2);
-                if (obstacle[n]) continue;
-                int i = opp[j];               /* direction n -> solid */
-                /* rho of n: collision conserves it, so the pre-collision
-                 * sum equals the value collide_cell saw. */
-                float rho = f[0][n]+f[1][n]+f[2][n]+f[3][n]+f[4][n]
-                          + f[5][n]+f[6][n]+f[7][n]+f[8][n];
-                bounce_into_solid(n, kt, i, rho, f_tmp[i][kt]);
-            }
-        }
-    }
-    /* Exponential moving average for a readable HUD (~40-step memory). */
-    Fx_s += 0.05f * (Fx_step - Fx_s);
-    Fy_s += 0.05f * (Fy_step - Fy_s);
 }
 
 static void apply_boundaries(void)
@@ -928,6 +1079,11 @@ EXPORT void lbm_set_les(int on, float cs)
  * ghost modes through its own relaxation rates). */
 EXPORT void lbm_set_regularized(int on) { regularized = on ? 1 : 0; }
 
+/* Select which derivative fields lbm_compute_fields() fills (bitmask:
+ * 1 vorticity, 2 schlieren, 4 dilatation); skipping unused ones saves
+ * a finite-difference pass per frame. */
+EXPORT void lbm_set_active_field(int mask) { field_mask = mask & 7; }
+
 /* Select the inlet/initial flow profile: 0 uniform, 1 shear layer, 2 jet. */
 EXPORT void lbm_set_flow_profile(int p)
 {
@@ -993,6 +1149,9 @@ EXPORT void lbm_compute_fields(void)
      *               motion, so it isolates the acoustic radiation the
      *               weakly-compressible LBM actually carries)
      */
+    int wv = field_mask & FIELD_VORT, ws = field_mask & FIELD_SCHL,
+        wd = field_mask & FIELD_DIL;
+    if (!field_mask) return;
     for (int y = 0; y < Ny; y++) {
         for (int x = 0; x < Nx; x++) {
             int k = idx(x, y);
@@ -1003,15 +1162,21 @@ EXPORT void lbm_compute_fields(void)
             int xm = x > 0 ? x - 1 : x, xp = x < Nx - 1 ? x + 1 : x;
             int ym = y > 0 ? y - 1 : y, yp = y < Ny - 1 ? y + 1 : y;
             float ddx = 1.f / (float)(xp - xm), ddy = 1.f / (float)(yp - ym);
-            float duy_dx = (uy_f[idx(xp, y)] - uy_f[idx(xm, y)]) * ddx;
-            float dux_dy = (ux_f[idx(x, yp)] - ux_f[idx(x, ym)]) * ddy;
-            float dux_dx = (ux_f[idx(xp, y)] - ux_f[idx(xm, y)]) * ddx;
-            float duy_dy = (uy_f[idx(x, yp)] - uy_f[idx(x, ym)]) * ddy;
-            float drho_dx = (rho_f[idx(xp, y)] - rho_f[idx(xm, y)]) * ddx;
-            float drho_dy = (rho_f[idx(x, yp)] - rho_f[idx(x, ym)]) * ddy;
-            vort_f[k] = duy_dx - dux_dy;
-            schl_f[k] = sqrtf(drho_dx * drho_dx + drho_dy * drho_dy);
-            dil_f[k]  = dux_dx + duy_dy;
+            if (wv) {
+                float duy_dx = (uy_f[idx(xp, y)] - uy_f[idx(xm, y)]) * ddx;
+                float dux_dy = (ux_f[idx(x, yp)] - ux_f[idx(x, ym)]) * ddy;
+                vort_f[k] = duy_dx - dux_dy;
+            }
+            if (ws) {
+                float drho_dx = (rho_f[idx(xp, y)] - rho_f[idx(xm, y)]) * ddx;
+                float drho_dy = (rho_f[idx(x, yp)] - rho_f[idx(x, ym)]) * ddy;
+                schl_f[k] = sqrtf(drho_dx * drho_dx + drho_dy * drho_dy);
+            }
+            if (wd) {
+                float dux_dx = (ux_f[idx(xp, y)] - ux_f[idx(xm, y)]) * ddx;
+                float duy_dy = (uy_f[idx(x, yp)] - uy_f[idx(x, ym)]) * ddy;
+                dil_f[k]  = dux_dx + duy_dy;
+            }
         }
     }
 }
@@ -1176,6 +1341,13 @@ static int field_finite(void)
 int main(void)
 {
     int fails = 0;
+#ifdef __EMSCRIPTEN_PTHREADS__
+    /* Threaded builds run the whole suite on the worker pool; results
+     * must be bitwise identical to the single-thread run (the row
+     * partition is deterministic and forces accumulate serially). */
+    lbm_set_threads(4);
+    printf("-- running with %d threads --\n", lbm_get_threads());
+#endif
     /* 1. Vortex-street regime: cylinder, Re ~ 220, 3000 steps. */
     lbm_init(300, 150);
     lbm_set_params(0.10f, 0.f, 0.55f);

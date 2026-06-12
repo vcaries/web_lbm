@@ -243,3 +243,17 @@ input[type="number"] {
   color: #6fc3ff;
   font-variant-numeric: tabular-nums;
 }
+
+/* Microphone spectrum panel (bottom-left, shown while mics exist). */
+#spectrum {
+  position: fixed;
+  left: 12px;
+  bottom: 12px;
+  display: none;
+  background: rgba(8, 10, 13, 0.78);
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  border-radius: 6px;
+  z-index: 5;
+  pointer-events: none;
+}
+#mic-add.placing { background: #2563eb; border-color: #3b82f6; color: #fff; }

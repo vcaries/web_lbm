@@ -4,6 +4,11 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>2D Wind Tunnel — Lattice Boltzmann / WebAssembly</title>
+<!-- coi-serviceworker: provides COOP/COEP (crossOriginIsolated) on static
+     hosts like GitHub Pages so the multithreaded engine can use
+     SharedArrayBuffer. Registers a service worker and reloads once; a
+     no-op where headers are already set or service workers unavailable. -->
+<script src="./coi-serviceworker.min.js"></script>
 <link rel="stylesheet" href="./style.css">
 </head>
 <body>
@@ -142,7 +147,20 @@
 
       <button id="clear-obstacles" class="danger">Clear all</button>
     </section>
+
+    <section>
+      <h2>Microphones</h2>
+      <p class="hint">Pressure probes: place up to 4 in the tunnel; their
+        spectra (FFT of p′) appear bottom-left with the Strouhal number of
+        the dominant peak. Esc cancels placement.</p>
+      <div class="preset-grid">
+        <button id="mic-add">Add microphone</button>
+        <button id="mic-clear">Clear mics</button>
+      </div>
+    </section>
   </aside>
+
+  <canvas id="spectrum" width="380" height="180"></canvas>
 
   <script type="module" src="./main.js"></script>
 </body>

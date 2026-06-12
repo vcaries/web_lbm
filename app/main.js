@@ -11,12 +11,30 @@
  * ArrayBuffer) or when lbm_resize() reallocates the arrays.
  */
 
-import createLBM from '../dist/lbm_engine.js';
 import { Renderer } from './renderer.js';
 import { COLORMAPS } from './colormaps.js';
 import { rasterizePreset, outlinePreset, PRESETS } from './obstacles.js';
 
 const $ = (id) => document.getElementById(id);
+
+/* Engine selection: the -pthread build needs crossOriginIsolated
+ * (SharedArrayBuffer). coi-serviceworker provides that on GitHub Pages
+ * after a one-time reload; anywhere it isn't available we fall back to
+ * the single-threaded engine, which is feature-identical. */
+let engineMT = false;
+let threadCount = 1;
+async function loadEngine() {
+  if (window.crossOriginIsolated) {
+    try {
+      const mod = await import('../dist/lbm_engine_mt.js');
+      engineMT = true;
+      return mod.default;
+    } catch (err) {
+      console.warn('Multithreaded engine unavailable, using single-threaded:', err);
+    }
+  }
+  return (await import('../dist/lbm_engine.js')).default;
+}
 
 let Module;            // Emscripten module instance
 let renderer;
@@ -51,6 +69,15 @@ let particleColor = '#ffffff';
 // call order) so per-shape rotation can be addressed by index.
 const cShapes = [];
 
+// Virtual microphones: pressure probes (p = rho/3) sampled once per frame
+// into a ring buffer, FFT'd into the spectrum panel. Positions are
+// normalized [0,1]^2 so they survive grid resizes.
+const MIC_MAX = 4;
+const MIC_N = 4096;                // ring length (frames) — sets df
+const MIC_COLORS = ['#ffd166', '#06d6a0', '#ef476f', '#3b9eff'];
+const mics = [];                   // {u, v, buf, head, count}
+let placingMic = false;
+
 // Presets drawn through the analytic JS rasterizers (the NACA airfoils,
 // per spec). Replayed after every grid resize. Cylinder/plate go through
 // the C engine's own registry (lbm_add_preset), which replays them itself.
@@ -59,6 +86,11 @@ const jsShapes = [];
 const DEFAULT_CMAP = {
   velocity: 'INFERNO', pressure: 'COOLWARM', vorticity: 'COOLWARM',
   schlieren: 'GRAY', dilatation: 'COOLWARM',
+};
+// Derivative-field bitmask for lbm_set_active_field (1 vorticity,
+// 2 schlieren, 4 dilatation) — skips unused finite-difference passes.
+const FIELD_MASKS = {
+  velocity: 0, pressure: 0, vorticity: 1, schlieren: 2, dilatation: 4,
 };
 const FIXED_DEFAULTS = {
   velocity:   { min: 0,      max: 0.2   },
@@ -229,6 +261,7 @@ function resizeGrid(newNx) {
   }
   Nx = newNx; Ny = newNy;
   initParticles();
+  for (const m of mics) { m.head = 0; m.count = 0; }   // restart recordings
   // Hand-painted cells were resampled and the C registry replayed inside
   // lbm_resize(); now re-rasterize the JS-side (NACA) shapes crisply.
   for (const s of jsShapes) {
@@ -286,6 +319,16 @@ function setupPainting(canvas) {
   };
 
   canvas.addEventListener('pointerdown', (e) => {
+    if (placingMic) {
+      const [u, v] = toNorm(e);
+      if (mics.length < MIC_MAX) {
+        mics.push({ u, v, buf: new Float32Array(MIC_N), head: 0, count: 0 });
+      }
+      placingMic = false;
+      $('mic-add').classList.remove('placing');
+      drawSpectrum();
+      return;
+    }
     if (placing) {
       const [u, v] = toNorm(e);
       addPresetAt(placing, u, v);
@@ -306,7 +349,11 @@ function setupPainting(canvas) {
   canvas.addEventListener('pointerup', stop);
   canvas.addEventListener('pointercancel', stop);
   window.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') setPlacing(null);
+    if (e.key === 'Escape') {
+      setPlacing(null);
+      placingMic = false;
+      $('mic-add').classList.remove('placing');
+    }
   });
 }
 
@@ -452,6 +499,150 @@ function drawParticles(ctx, w, h) {
   ctx.globalAlpha = 1;
 }
 
+/* ------------------------------------------------------------------ */
+/* Virtual microphones: recording, FFT, spectrum panel                  */
+/* ------------------------------------------------------------------ */
+
+function recordMics() {
+  for (const m of mics) {
+    const gx = Math.min(Nx - 2, Math.max(1, Math.round(m.u * Nx)));
+    const gy = Math.min(Ny - 2, Math.max(1, Math.round(m.v * Ny)));
+    m.buf[m.head] = views.rho[gy * Nx + gx] / 3;   // p = rho / 3
+    m.head = (m.head + 1) % MIC_N;
+    m.count++;
+  }
+}
+
+/** In-place iterative radix-2 complex FFT (n = power of two). */
+function fft(re, im) {
+  const n = re.length;
+  for (let i = 1, j = 0; i < n; i++) {
+    let bit = n >> 1;
+    for (; j & bit; bit >>= 1) j ^= bit;
+    j |= bit;
+    if (i < j) {
+      [re[i], re[j]] = [re[j], re[i]];
+      [im[i], im[j]] = [im[j], im[i]];
+    }
+  }
+  for (let len = 2; len <= n; len <<= 1) {
+    const ang = (-2 * Math.PI) / len;
+    const wr = Math.cos(ang), wi = Math.sin(ang);
+    for (let i = 0; i < n; i += len) {
+      let cr = 1, ci = 0;
+      for (let j = 0; j < len / 2; j++) {
+        const a = i + j, b = i + j + len / 2;
+        const vr = re[b] * cr - im[b] * ci;
+        const vi = re[b] * ci + im[b] * cr;
+        re[b] = re[a] - vr; im[b] = im[a] - vi;
+        re[a] += vr;        im[a] += vi;
+        const ncr = cr * wr - ci * wi;
+        ci = cr * wi + ci * wr;
+        cr = ncr;
+      }
+    }
+  }
+}
+
+/** Spectrum of one mic: Hann-windowed, mean-removed FFT magnitude of the
+ *  newest pow2-sized stretch of the ring. Returns null until ~5s of data. */
+function micSpectrum(m) {
+  let n = 256;
+  while (n * 2 <= Math.min(m.count, MIC_N)) n *= 2;
+  if (n > Math.min(m.count, MIC_N)) return null;
+  const re = new Float32Array(n), im = new Float32Array(n);
+  const start = (m.head - n + MIC_N) % MIC_N;
+  let mean = 0;
+  for (let i = 0; i < n; i++) mean += m.buf[(start + i) % MIC_N];
+  mean /= n;
+  for (let i = 0; i < n; i++) {
+    const w = 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / (n - 1));   // Hann
+    re[i] = (m.buf[(start + i) % MIC_N] - mean) * w;
+  }
+  fft(re, im);
+  const mag = new Float32Array(n / 2);
+  for (let i = 1; i < n / 2; i++) mag[i] = Math.hypot(re[i], im[i]);
+  return { mag, n };
+}
+
+function drawSpectrum() {
+  const c = $('spectrum');
+  if (!mics.length) { c.style.display = 'none'; return; }
+  c.style.display = 'block';
+  const ctx = c.getContext('2d');
+  const w = c.width, h = c.height;
+  ctx.clearRect(0, 0, w, h);
+  ctx.font = '11px ui-monospace, Consolas, monospace';
+
+  const L = Module._lbm_get_char_length();
+  const u0 = parseFloat($('vel').value);
+  const dt = stepsPerFrame;          // sim steps per recorded sample
+  const plotL = 42, plotR = w - 8, plotT = 22, plotB = h - 26;
+  ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+  ctx.strokeRect(plotL, plotT, plotR - plotL, plotB - plotT);
+  ctx.fillStyle = '#8d97a5';
+  ctx.fillText('|p′(f)|  (log)', 8, 14);
+
+  let anyData = false;
+  mics.forEach((m, mi) => {
+    const spec = micSpectrum(m);
+    const color = MIC_COLORS[mi];
+    if (!spec) {
+      ctx.fillStyle = color;
+      ctx.fillText(`M${mi + 1} collecting…`, plotL + 6 + mi * 90, h - 8);
+      return;
+    }
+    anyData = true;
+    const { mag, n } = spec;
+    const nShow = Math.min(mag.length, 256);     // low-frequency band
+    let hi = 1e-12;
+    for (let i = 1; i < nShow; i++) if (mag[i] > hi) hi = mag[i];
+    const lo = hi * 1e-4;
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.2;
+    ctx.beginPath();
+    for (let i = 1; i < nShow; i++) {
+      const x = plotL + ((i - 1) / (nShow - 2)) * (plotR - plotL);
+      const t = Math.max(0, Math.log(Math.max(mag[i], lo) / lo)
+                            / Math.log(hi / lo));
+      const y = plotB - t * (plotB - plotT);
+      if (i === 1) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+    // Dominant peak -> Strouhal number St = f L / u0 (f in cycles/step).
+    let pk = 2;
+    for (let i = 3; i < nShow; i++) if (mag[i] > mag[pk]) pk = i;
+    const f = pk / (n * dt);
+    const st = u0 > 0 ? (f * L) / u0 : 0;
+    ctx.fillStyle = color;
+    ctx.fillText(`M${mi + 1} St=${st.toFixed(2)}`, plotL + 6 + mi * 90, h - 8);
+  });
+  if (anyData) {
+    ctx.fillStyle = '#8d97a5';
+    ctx.textAlign = 'right';
+    ctx.fillText(`f → 0 … ${(256 / (MIC_N * dt)).toExponential(1)} cyc/step`,
+                 plotR, 14);
+    ctx.textAlign = 'left';
+  }
+}
+
+function drawMicMarkers(ctx, w, h) {
+  mics.forEach((m, mi) => {
+    const px = m.u * w, py = h - m.v * h;
+    ctx.strokeStyle = MIC_COLORS[mi];
+    ctx.fillStyle = MIC_COLORS[mi];
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.arc(px, py, 5, 0, 2 * Math.PI);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(px, py, 1.6, 0, 2 * Math.PI);
+    ctx.fill();
+    ctx.font = `${Math.max(10, w / 90)}px ui-monospace, Consolas, monospace`;
+    ctx.fillText(`M${mi + 1}`, px + 7, py - 6);
+  });
+}
+
 /** Dashed translucent contour of the armed preset, following the cursor. */
 function drawGhost(ctx, w, h) {
   const angle = parseFloat($('angle').value);
@@ -485,6 +676,7 @@ function drawOverlay() {
   if (overlayMode === 'streamlines') drawStreamlines(octx, w, h);
   else if (overlayMode === 'arrows') drawArrows(octx, w, h);
   else if (overlayMode === 'particles') drawParticles(octx, w, h);
+  if (mics.length) drawMicMarkers(octx, w, h);
   if (placing && ghostPos) drawGhost(octx, w, h);
 }
 
@@ -521,7 +713,8 @@ function updateHUD() {
   $('hud').textContent =
     `Re = ${re.toFixed(0)}    τ = ${tau.toFixed(3)}    step ${stepCount}\n` +
     `Cl = ${Cl >= 0 ? '+' : ''}${Cl.toFixed(3)}   Cd = ${Cd.toFixed(3)}\n` +
-    `${msFrame > 0 ? (1000 / msFrame).toFixed(0) : '--'} fps`;
+    `${msFrame > 0 ? (1000 / msFrame).toFixed(0) : '--'} fps · ` +
+    `${threadCount} thread${threadCount > 1 ? 's' : ''}`;
   $('re-val').textContent = `Re ≈ ${re.toFixed(0)}`;
 }
 
@@ -532,6 +725,10 @@ function tick(now) {
 
   ensureViews();
   if (overlayMode === 'particles') advectParticles();
+  if (mics.length) {
+    recordMics();
+    if (frame % 30 === 0) drawSpectrum();
+  }
   const view = currentFieldView();
   const [lo, hi] = fieldBounds(view);
   renderer.uploadField(view);
@@ -592,6 +789,7 @@ function setupUI() {
       document.querySelectorAll('#viz-mode button')
         .forEach((b) => b.classList.toggle('active', b === btn));
       fieldMode = btn.dataset.mode;
+      Module._lbm_set_active_field(FIELD_MASKS[fieldMode]);
       const cmap = DEFAULT_CMAP[fieldMode];
       $('cmap').value = cmap;
       renderer.setColormap(COLORMAPS[cmap]);
@@ -666,6 +864,17 @@ function setupUI() {
   }
   $('clear-obstacles').addEventListener('click', clearObstacles);
 
+  // Microphones: arm click-to-place; clear empties the list.
+  $('mic-add').addEventListener('click', () => {
+    placingMic = !placingMic && mics.length < MIC_MAX;
+    setPlacing(null);
+    $('mic-add').classList.toggle('placing', placingMic);
+  });
+  $('mic-clear').addEventListener('click', () => {
+    mics.length = 0;
+    $('spectrum').style.display = 'none';
+  });
+
   // Collapsible panel.
   $('panel-toggle').addEventListener('click', () => {
     $('panel').classList.toggle('collapsed');
@@ -677,6 +886,7 @@ function setupUI() {
 /* ------------------------------------------------------------------ */
 
 async function boot() {
+  const createLBM = await loadEngine();
   Module = await createLBM();
   forcesPtr = Module._malloc(8);
 
@@ -697,6 +907,11 @@ async function boot() {
   Module._lbm_set_wall_mode(0);          // free-slip tunnel walls
   Module._lbm_set_les(1, 0.18);          // Smagorinsky on by default
   Module._lbm_set_regularized(1);        // Hermite-regularized collision
+  Module._lbm_set_active_field(FIELD_MASKS[fieldMode]);
+  if (engineMT) {
+    Module._lbm_set_threads(Math.min(8, navigator.hardwareConcurrency || 4));
+  }
+  threadCount = Module._lbm_get_threads();
   Module._lbm_add_preset(0, 0.18, 0.5, 0.25, 0);  // starter cylinder, upstream
   cShapes.push({ name: 'cylinder', omega: 0 });
   rebuildCylinderList();

@@ -140,13 +140,28 @@ export class Renderer {
                      gl.RGBA, gl.UNSIGNED_BYTE, lut);
   }
 
+  /** With the -pthread engine the wasm heap is a SharedArrayBuffer, and
+   *  not every browser accepts SAB-backed views in texSubImage2D — stage
+   *  through a small ordinary buffer in that case (the one exception to
+   *  the zero-copy data path; ~0.05 ms for a 300x150 field). */
+  _staged(view, Ctor, slot) {
+    if (typeof SharedArrayBuffer === 'undefined'
+        || !(view.buffer instanceof SharedArrayBuffer)) return view;
+    if (!this[slot] || this[slot].length !== view.length) {
+      this[slot] = new Ctor(view.length);
+    }
+    this[slot].set(view);
+    return this[slot];
+  }
+
   /** Per-frame scalar upload, straight from the wasm-memory view. */
   uploadField(view) {
     const gl = this.gl;
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, this.fieldTex);
     gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, this.Nx, this.Ny,
-                     gl.RED, gl.FLOAT, view);
+                     gl.RED, gl.FLOAT,
+                     this._staged(view, Float32Array, '_stageF'));
   }
 
   /** Obstacle mask upload — only called when the mask changed. */
@@ -155,7 +170,8 @@ export class Renderer {
     gl.activeTexture(gl.TEXTURE1);
     gl.bindTexture(gl.TEXTURE_2D, this.obstacleTex);
     gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, this.Nx, this.Ny,
-                     gl.RED_INTEGER, gl.UNSIGNED_BYTE, view);
+                     gl.RED_INTEGER, gl.UNSIGNED_BYTE,
+                     this._staged(view, Uint8Array, '_stageO'));
   }
 
   /** Match the drawing buffer to CSS size * devicePixelRatio. */
